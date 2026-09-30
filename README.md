@@ -34,3 +34,7 @@ State is in /var/lib/dkol-server, run as user dkol.
 The client looks up dkol1st.sting.jp and falls back to 210.196.202.18. Make that
 name resolve to the server or use a client patched with a different name.
 Probably with the Hosts file on your computer is the easiest way.
+
+## License
+
+MIT License (available in the source tree as /LICENSE)
