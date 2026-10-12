@@ -1,9 +1,11 @@
 //! Frame codec and field primitives
 
 use encoding_rs::EUC_JP;
-use eyre::{Result, bail, ensure};
+use eyre::{Result, WrapErr, bail, ensure};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 pub const HEADER: usize = 8;
 
@@ -16,34 +18,43 @@ pub struct Frame {
 const TRANS_MAX: usize = 1 << 20;
 /// GAME_FINISH / GAME_SAVE from a non-host: 65535 zeroed save bytes as b64 (87380) + 52
 const ZERO_SAVE: usize = 87432;
+/// The client gives up on a body after 5 s, we do too
+const BODY_WAIT: Duration = Duration::from_secs(5);
 
 pub async fn read_frame(r: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
     let mut h = [0; HEADER];
     r.read_exact(&mut h).await?;
     let id = i16::from_le_bytes([h[4], h[5]]);
     let len = u16::from_le_bytes([h[6], h[7]]) as usize;
-    let len = match id {
-        // The i16 length wraps, 21896 is the only way it does
-        23 | 24 if len == ZERO_SAVE & 0xffff => ZERO_SAVE,
-        // SET_ZUKAN: the TransHeader's i32 size is the real body length
-        44 => {
-            let mut s = [0; 4];
-            r.read_exact(&mut s).await?;
-            let size = i32::from_le_bytes(s) as usize;
-            ensure!(
-                (4..=TRANS_MAX).contains(&size),
-                "frame id {id}: bad size {size}"
-            );
-            let mut body = s.to_vec();
-            body.resize(size, 0);
-            r.read_exact(&mut body[4..]).await?;
-            return Ok(Frame { id, body });
-        }
-        _ => len,
+    // a client whose serializer fails sends a short body with a full-length header
+    let body = async {
+        let len = match id {
+            // The i16 length wraps, 21896 is the only way it does
+            23 | 24 if len == ZERO_SAVE & 0xffff => ZERO_SAVE,
+            // SET_ZUKAN: the TransHeader's i32 size is the real body length
+            44 => {
+                let mut s = [0; 4];
+                r.read_exact(&mut s).await?;
+                let size = i32::from_le_bytes(s) as usize;
+                ensure!(
+                    (4..=TRANS_MAX).contains(&size),
+                    "frame id {id}: bad size {size}"
+                );
+                let mut body = s.to_vec();
+                body.resize(size, 0);
+                r.read_exact(&mut body[4..]).await?;
+                return Ok(body);
+            }
+            _ => len,
+        };
+        ensure!(len >= HEADER, "frame id {id}: bad length {len}");
+        let mut body = vec![0; len - HEADER];
+        r.read_exact(&mut body).await?;
+        Ok(body)
     };
-    ensure!(len >= HEADER, "frame id {id}: bad length {len}");
-    let mut body = vec![0; len - HEADER];
-    r.read_exact(&mut body).await?;
+    let body = timeout(BODY_WAIT, body)
+        .await
+        .wrap_err_with(|| format!("frame id {id}: body cut short"))??;
     Ok(Frame { id, body })
 }
 
